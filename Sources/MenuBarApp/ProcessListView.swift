@@ -19,9 +19,6 @@ struct ProcessListView: View {
     @State private var selectedTab: Int = 0 // 0: All, 1: User, 2: System
     @State private var showUninstallAlert: RunningApp? = nil
     
-    // Smart Clean State
-    @State private var showSmartSheet = false
-    @State private var smartSuggestions: [RunningApp] = []
     
     var body: some View {
         ZStack {
@@ -29,71 +26,11 @@ struct ProcessListView: View {
             VisualEffectView().edgesIgnoringSafeArea(.all)
             
             VStack(spacing: 0) {
-                // Header: RAM Stats
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading) {
-                        Text("Total RAM")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                        Text(processManager.stats.totalString)
-                            .font(.headline)
-                            .foregroundColor(.primary)
-                    }
-                    
-                    Divider().frame(height: 24)
-                    
-                    VStack(alignment: .leading) {
-                        Text("Used")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                        Text(processManager.stats.usedString)
-                            .font(.headline)
-                            .foregroundColor(.primary)
-                    }
-                    
-                    Spacer()
-                    
-                    // Smart Clean Button (New)
-                    Button(action: {
-                        // Just open the sheet, let the sheet handle scanning animation
-                        // But we can pre-fetch or scan inside the view. 
-                        // To make "Scanning" animation real, let's fetch in the view or fetch here. 
-                        // The plan is: Animations in Sheet.
-                        // So we just set showSmartSheet = true, but we need suggestions.
-                        // We can calculate them now or let the view do it. 
-                        // To support the "Scanning" phase of 2 seconds, we should calculate effectively during that time or before. 
-                        
-                        // Heuristic check: if empty, maybe show "All Good"? 
-                        // The user wants theatrics. So always show scanning.
-                        
-                        smartSuggestions = processManager.getSmartCleanSuggestions()
-                        showSmartSheet = true
-                    }) {
-                        Image(systemName: "sparkles")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundColor(.purple)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Smart Clean Suggestions")
-                    
-                    Divider().frame(height: 16)
-                    
-                    // Refresh Button
-                    Button(action: {
-                        withAnimation {
-                            processManager.refreshProcesses()
-                        }
-                    }) {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 14))
-                            .foregroundColor(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(16)
-                .background(Color.clear) // Transparent to show glass
+                // Use new Dashboard Header
+                // Use new Dashboard Header
+                DashboardHeader(manager: processManager)
                 
-                Divider() 
+                Divider().padding(.top, 10)
                 
                 // Tabs
                 HStack(spacing: 0) {
@@ -109,9 +46,7 @@ struct ProcessListView: View {
                 ScrollView {
                     LazyVStack(spacing: 0) {
                         ForEach(filteredProcesses) { process in
-                            ProcessRow(process: process, isHovering: hoveredAppId == process.id, onHover: { hovering in
-                                hoveredAppId = hovering ? process.id : nil
-                            }, onTerminate: {
+                            ProcessRow(process: process, onTerminate: {
                                 processManager.termintateApp(process)
                             }, onUninstall: {
                                 showUninstallAlert = process
@@ -127,6 +62,21 @@ struct ProcessListView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                     Spacer()
+                    
+                    // Refresh Button (Moved to Footer)
+                    Button(action: {
+                        withAnimation {
+                            processManager.refreshProcesses()
+                        }
+                    }) {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Refresh")
+                    .padding(.trailing, 8)
+                    
                     Button("Quit Pulse") {
                         NSApplication.shared.terminate(nil)
                     }
@@ -139,16 +89,7 @@ struct ProcessListView: View {
                 .overlay(Divider(), alignment: .top)
             }
             
-            // Intelligence Overlay
-            if showSmartSheet {
-                VisualEffectView().edgesIgnoringSafeArea(.all) // Blur background content
-                    .opacity(0.8)
-                    .transition(.opacity)
-                
-                IntelligenceView(processManager: processManager, showSheet: $showSmartSheet, suggestions: $smartSuggestions)
-                    .transition(.scale(scale: 0.9).combined(with: .opacity))
-                    .zIndex(1)
-            }
+
         }
         .frame(width: 360, height: 550)
         .alert(item: $showUninstallAlert) { app in
@@ -173,240 +114,87 @@ struct ProcessListView: View {
     }
 }
 
-enum IntelligenceState {
-    case scanning
-    case results
-    case cleaning
-    case success
-}
-
-struct IntelligenceView: View {
-    @ObservedObject var processManager: ProcessManager
-    @Binding var showSheet: Bool
-    @Binding var suggestions: [RunningApp]
-    
-    @State private var state: IntelligenceState = .scanning
-    @State private var scanRotation: Double = 0
-    @State private var scanScale: CGFloat = 0.8
-    @State private var scanOpacity: Double = 0.5
-    @State private var savedMemory: String = "0 MB"
+struct DashboardHeader: View {
+    @ObservedObject var manager: ProcessManager
     
     var body: some View {
-        ZStack {
-            VisualEffectView().edgesIgnoringSafeArea(.all)
-            
-            VStack {
-                if state == .scanning {
-                    LiquidScanningView()
-                        .onAppear {
-                            // Mock scan delay
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { // Extended duration for effect
-                                withAnimation {
-                                    state = .results
-                                }
-                            }
-                        }
-                } else if state == .results {
-                    ResultsView(processManager: processManager, suggestions: suggestions, onClean: {
-                        withAnimation {
-                            state = .cleaning
-                        }
-                        
-                        // Calculate saved memory for display
-                        let totalVal = suggestions.reduce(0) { $0 + $1.memoryUsageValue }
-                        if totalVal > 1024 {
-                             savedMemory = String(format: "%.1f GB", totalVal / 1024)
-                        } else {
-                             savedMemory = String(format: "%.0f MB", totalVal)
-                        }
-                        
-                        // Perform Clean
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                            for app in suggestions {
-                                processManager.termintateApp(app)
-                            }
-                            withAnimation {
-                                state = .success
-                            }
-                            
-                            // Auto dismiss
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                showSheet = false
-                            }
-                        }
-                    }, onDismiss: {
-                        showSheet = false
-                    })
-                } else if state == .cleaning {
-                    VStack(spacing: 20) {
-                        ProgressView()
-                            .scaleEffect(1.5)
-                        Text("Releasing Memory...")
-                            .font(.headline)
-                    }
-                } else if state == .success {
-                    VStack(spacing: 20) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 60))
-                            .foregroundColor(.green)
-                            .scaleEffect(1.2)
-                        
-                        Text("Optimized!")
-                            .font(.title2.bold())
-                        
-                        Text("Freed \(savedMemory) of RAM")
-                            .font(.body)
-                            .foregroundColor(.secondary)
-                    }
-                    .transition(.scale)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity) // Fill parent
-            .background(Color.clear)
-        }
-    }
-}
-
-struct LiquidScanningView: View {
-    @State private var wave1 = false
-    @State private var wave2 = false
-    @State private var wave3 = false
-    
-    var body: some View {
-        ZStack {
-            // Background - Liquid Glass
-            VisualEffectView().edgesIgnoringSafeArea(.all)
-                .opacity(0.9) // Strong blur
-            
-            // Central Pulse Core
-            Circle()
-                .fill(Color.purple.opacity(0.3))
-                .frame(width: 80, height: 80)
-                .blur(radius: 10)
-            
-            // Wave 1
-            Circle()
-                .stroke(Color.primary.opacity(0.3), lineWidth: 2) // Adaptive color
-                .frame(width: 80, height: 80)
-                .scaleEffect(wave1 ? 3 : 1)
-                .opacity(wave1 ? 0 : 1)
-                .onAppear {
-                    withAnimation(.easeOut(duration: 2).repeatForever(autoreverses: false)) {
-                        wave1 = true
-                    }
-                }
-            
-            // Wave 2
-            Circle()
-                .stroke(Color.purple.opacity(0.4), lineWidth: 1.5)
-                .frame(width: 80, height: 80)
-                .scaleEffect(wave2 ? 2.5 : 1)
-                .opacity(wave2 ? 0 : 1)
-                .onAppear {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        withAnimation(.easeOut(duration: 2).repeatForever(autoreverses: false)) {
-                            wave2 = true
-                        }
-                    }
-                }
-            
-            // Wave 3 (Inner)
-            Circle()
-                .stroke(Color.blue.opacity(0.3), lineWidth: 1)
-                .frame(width: 80, height: 80)
-                .scaleEffect(wave3 ? 2 : 1)
-                .opacity(wave3 ? 0 : 1)
-                .onAppear {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                        withAnimation(.easeOut(duration: 2).repeatForever(autoreverses: false)) {
-                            wave3 = true
-                        }
-                    }
-                }
-            
-            // Icon
-            Image(systemName: "sparkles")
-                .font(.system(size: 30))
-                .foregroundColor(.primary) // Adaptive
-                .shadow(color: .purple.opacity(0.5), radius: 10)
-            
-            VStack(spacing: 8) {
+        VStack(spacing: 10) {
+            HStack {
+                Text("Pulse")
+                    .font(.system(size: 20, weight: .bold, design: .rounded))
                 Spacer()
-                Text("Analyzing System Memory...")
-                    .font(.system(size: 11, weight: .semibold, design: .rounded)) // Modern rounded font
+                
+
+                Spacer().frame(width: 8)
+                
+                // Static Pulse Icon
+                Image(systemName: "waveform.path.ecg")
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 22, height: 22)
                     .foregroundColor(.secondary)
-                    .padding(.bottom, 60)
             }
+            .padding(.horizontal)
+            
+            // Stats Cars
+            HStack(spacing: 12) {
+                // Physical RAM
+                StatCard(
+                    title: "Physical RAM",
+                    value: manager.stats.memoryPressure,
+                    icon: "memorychip",
+                    color: .blue
+                )
+                
+                // Swap Memory
+                StatCard(
+                    title: "Swap Used",
+                    value: manager.stats.swapString,
+                    icon: "externaldrive.fill",
+                    color: .orange
+                )
+            }
+            .padding(.horizontal)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.top, 10)
     }
 }
 
-struct ResultsView: View {
-    @ObservedObject var processManager: ProcessManager
-    let suggestions: [RunningApp]
-    let onClean: () -> Void
-    let onDismiss: () -> Void
+struct StatCard: View {
+    let title: String
+    let value: String
+    let icon: String
+    let color: Color
+    @State private var isHovering = false
     
     var body: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 40))
-                .foregroundColor(.orange)
-                .padding(.top, 20)
-            
-            Text("Optimization Ready")
-                .font(.title2.weight(.bold))
-            
-            Text("Found \(suggestions.count) background apps consuming significant memory.")
-                .font(.body)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal)
-            
-            ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(suggestions) { app in
-                        HStack {
-                            if let icon = app.icon {
-                                Image(nsImage: icon)
-                                    .resizable()
-                                    .frame(width: 24, height: 24)
-                            }
-                            Text(app.name)
-                                .fontWeight(.medium)
-                            Spacer()
-                            Text(app.memoryUsage)
-                                .font(.caption.monospaced())
-                                .foregroundColor(.secondary)
-                        }
-                        .padding(8)
-                        .background(Color.primary.opacity(0.05))
-                        .cornerRadius(8)
-                    }
-                }
-                .padding()
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Image(systemName: icon)
+                    .foregroundColor(color)
+                    .font(.system(size: 12))
+                Text(title)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.secondary)
             }
-            .frame(height: 120)
             
-            HStack(spacing: 12) {
-                Button("Dismiss") {
-                    onDismiss()
-                }
-                .keyboardShortcut(.cancelAction)
-                
-                Button(action: onClean) {
-                    Text("Clean All")
-                        .fontWeight(.semibold)
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-                        .background(Color.purple)
-                        .cornerRadius(8)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.bottom, 20)
+            Text(value)
+                .font(.system(size: 14, weight: .semibold, design: .rounded))
+                .foregroundColor(.primary)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.6))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(isHovering ? color.opacity(0.5) : Color.clear, lineWidth: 1)
+        )
+        .scaleEffect(isHovering ? 1.02 : 1.0)
+        .animation(.spring(response: 0.3), value: isHovering)
+        .onHover { hover in isHovering = hover }
     }
 }
 
@@ -436,41 +224,53 @@ struct TabButton: View {
 
 struct ProcessRow: View {
     let process: RunningApp
-    let isHovering: Bool
-    let onHover: (Bool) -> Void
     let onTerminate: () -> Void
     let onUninstall: () -> Void
+    @State private var isHovering = false
     
     var body: some View {
         HStack {
             // Icon
-            if let icon = process.icon {
-                Image(nsImage: icon)
+            if let nsIcon = process.icon {
+                Image(nsImage: nsIcon)
                     .resizable()
-                    .frame(width: 28, height: 28)
+                    .frame(width: 24, height: 24)
             } else {
-                Image(systemName: "app")
+                Image(systemName: "gearshape.fill")
+                    .resizable()
+                    .frame(width: 24, height: 24)
                     .foregroundColor(.secondary)
-                    .frame(width: 28, height: 28)
             }
             
-            // Name & Details
             VStack(alignment: .leading, spacing: 2) {
                 Text(process.name)
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.primary)
+                    .foregroundColor(process.isUserApp ? .primary : .secondary)
                 
-                HStack(spacing: 6) {
-                    Text(process.memoryUsage)
-                        .font(.system(size: 11, weight: .bold, design: .monospaced))
-                        .foregroundColor(.secondary)
-                }
+                let subtext = process.isUserApp ? "User App" : "System (\(process.user))"
+                Text(subtext)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
             }
             
             Spacer()
             
+            // Memory Badge
+            Text(process.memoryUsage)
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule()
+                        .fill(process.memoryUsageValue > 500 ? Color.orange.opacity(0.2) : Color.gray.opacity(0.1))
+                )
+                .foregroundColor(process.memoryUsageValue > 500 ? .orange : .secondary)
+            
+            Spacer()
+            .frame(width: 10)
+            
             HStack(spacing: 8) {
-                // Terminate Button (Always Visible)
+                // Terminate Button
                 Button(action: onTerminate) {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 14))
@@ -494,7 +294,11 @@ struct ProcessRow: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(isHovering ? Color.primary.opacity(0.1) : Color.clear)
-        .onHover(perform: onHover)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.2)) {
+                isHovering = hovering
+            }
+        }
     }
     
     // Quick heuristic for row helper

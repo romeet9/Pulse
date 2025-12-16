@@ -1,13 +1,15 @@
 import AppKit
 import Foundation
 
+
 struct RunningApp: Identifiable {
     let id: pid_t
     let name: String
     let icon: NSImage?
-    let app: NSRunningApplication
+    let app: NSRunningApplication? // Nullable now, as many won't have it
     let memoryUsageValue: Double // In MB
     let isUserApp: Bool
+    let user: String
     
     var memoryUsage: String {
         if memoryUsageValue > 1024 {
@@ -19,17 +21,22 @@ struct RunningApp: Identifiable {
 
 struct SystemStats {
     var totalRAM: Double // GB
-    var usedRAM: Double // GB
+    var physicalUsedRAM: Double // GB
+    var swapUsedRAM: Double // GB
     var freeRAM: Double // GB
     
-    var usedString: String { String(format: "%.1f GB", usedRAM) }
-    var totalString: String { String(format: "%.0f GB", totalRAM) }
-    var percentage: Double { usedRAM / totalRAM }
+    var memoryPressure: String {
+        return String(format: "Phy: %.1f/%.0f GB", physicalUsedRAM, totalRAM)
+    }
+    
+    var swapString: String {
+        return String(format: "Swap: %.1f GB", swapUsedRAM)
+    }
 }
 
 class ProcessManager: ObservableObject {
     @Published var processes: [RunningApp] = []
-    @Published var stats: SystemStats = SystemStats(totalRAM: 8, usedRAM: 4, freeRAM: 4)
+    @Published var stats: SystemStats = SystemStats(totalRAM: 8, physicalUsedRAM: 4, swapUsedRAM: 2, freeRAM: 2)
     
     init() {
         refreshProcesses()
@@ -38,115 +45,132 @@ class ProcessManager: ObservableObject {
     func refreshProcesses() {
         refreshStats()
         
-        let apps = NSWorkspace.shared.runningApplications
+        // 1. Get raw process list via `ps`
+        // Columns: pid, ppid, rss (kb), user, command
+        let output = runCommand("/bin/ps", args: ["-Ao", "pid,rss,user,comm"])
+        let lines = output.components(separatedBy: "\n")
         
-        let relevantApps = apps.filter { app in
-            if app.processIdentifier == ProcessInfo.processInfo.processIdentifier { return false }
-            return app.activationPolicy == .regular || app.activationPolicy == .accessory
+        // 2. Map existing NSRunningApplications for Icons/Pretty Names
+        let workspaceApps = NSWorkspace.shared.runningApplications
+        var appMap: [pid_t: NSRunningApplication] = [:]
+        for app in workspaceApps {
+            appMap[app.processIdentifier] = app
         }
         
-        let appsWithMemory = relevantApps.map { app -> RunningApp in
-            let mem = getMemoryUsageValue(pid: app.processIdentifier)
+        let currentUser = NSUserName()
+        var newProcesses: [RunningApp] = []
+        
+        // Skip header row
+        for line in lines.dropFirst() {
+            let components = line.trimmingCharacters(in: .whitespaces).components(separatedBy: .whitespaces)
+            let filtered = components.filter { !$0.isEmpty }
             
-            // Categorization Logic
-            var isUser = false
-            if let url = app.bundleURL {
-                let path = url.path
-                // Consider apps in /Applications, /Users/x/Applications, or user's Downloads/Desktop as "User Apps"
-                // Exclude /System
-                if path.hasPrefix("/System") || path.hasPrefix("/usr") || path.hasPrefix("/bin") {
-                    isUser = false
-                } else if path.contains("/Applications") || path.hasPrefix("/Users") {
-                    isUser = true
+            // Need at least PID, RSS, USER, COMM
+            if filtered.count >= 4 {
+                if let pid = pid_t(filtered[0]),
+                   let rssKB = Double(filtered[1]) {
+                    
+                    let user = filtered[2]
+                    // Command might differ, usually the rest of tokens
+                    // But `comm` gives short name usually. 
+                    // Let's rely on NSRunningApplication name if available, else binary name.
+                    
+                    // Filter out this app itself to avoid confusion? Optional.
+                    if pid == ProcessInfo.processInfo.processIdentifier { continue }
+                    
+                    let workspaceApp = appMap[pid]
+                    let name = workspaceApp?.localizedName ?? (filtered.last ?? "Unknown").components(separatedBy: "/").last ?? "Unknown"
+                    
+                    // Icon logic
+                    let icon = workspaceApp?.icon ?? NSWorkspace.shared.icon(forFileType: NSFileTypeForHFSTypeCode(OSType(kGenericApplicationIcon)))
+                    
+                    // Categorization
+                    // "User App" if: Running as current user AND likely has a UI (in AppMap) OR in /Applications
+                    // "System" if: root, _coreaudiod, etc.
+                    
+                    var isUser = false
+                    if user == currentUser {
+                        // Further refinement: If it's a known GUI app or path contains App
+                        if workspaceApp != nil {
+                            isUser = true
+                        } else if line.contains("/Applications") || line.contains("/Users/") {
+                             isUser = true  
+                        }
+                    }
+                    
+                    // Special Case: kernel_task
+                    if pid == 0 { 
+                         // Doesn't show up in ps usually as pid 0, but if it does:
+                    }
+
+                    newProcesses.append(RunningApp(
+                        id: pid,
+                        name: name,
+                        icon: workspaceApp?.icon, // Pass nil if no Workspace App, UI will handle generic
+                        app: workspaceApp,
+                        memoryUsageValue: rssKB / 1024.0, // KB -> MB
+                        isUserApp: isUser,
+                        user: user
+                    ))
                 }
             }
-            
-            return RunningApp(
-                id: app.processIdentifier,
-                name: app.localizedName ?? "Unknown",
-                icon: app.icon,
-                app: app,
-                memoryUsageValue: mem,
-                isUserApp: isUser
-            )
         }
         
-        // Sort by Memory (Descending)
-        self.processes = appsWithMemory.sorted { $0.memoryUsageValue > $1.memoryUsageValue }
+        self.processes = newProcesses.sorted { $0.memoryUsageValue > $1.memoryUsageValue }
     }
     
-    func getSmartCleanSuggestions() -> [RunningApp] {
-        // Heuristic:
-        // 1. Is User App
-        // 2. High Memory (> 300 MB for demo, maybe 500MB in prod)
-        // 3. Not the active app
-        
-        // Note: In a real "AI" scenario, we might track usage over time.
-        // Here we look for immediate "heavy background" apps.
-        
-        let activeApp = NSWorkspace.shared.frontmostApplication
-        
-        return processes.filter { app in
-            guard app.isUserApp else { return false }
-            
-            // Don't suggest the app user is currently using
-            if app.app.processIdentifier == activeApp?.processIdentifier { return false }
-            
-            // Threshold: 300MB (Lowered for visibility/testing, user asked for "High RAM")
-            if app.memoryUsageValue > 300 {
-                return true
-            }
-            
-            return false
-        }
-    }
+
     
     func termintateApp(_ app: RunningApp) {
-        app.app.terminate()
-        // Optimistic remove
+        if let nsApp = app.app {
+            nsApp.terminate()
+        } else {
+            // Force Kill for non-NSApps (using kill command)
+            // Only if owned by user
+            if app.user == NSUserName() {
+                let _ = runCommand("/bin/kill", args: ["\(app.id)"])
+            }
+        }
+        
         if let index = processes.firstIndex(where: { $0.id == app.id }) {
             processes.remove(at: index)
         }
     }
     
     func uninstallApp(_ app: RunningApp) {
+        guard let nsApp = app.app else { return } // Cannot uninstall CLI tools easily
         AppCleaner.uninstall(app: app)
-        // It will terminate in the process
         if let index = processes.firstIndex(where: { $0.id == app.id }) {
             processes.remove(at: index)
         }
     }
     
-    private func getMemoryUsageValue(pid: pid_t) -> Double {
+    // Helper to run shell commands
+    private func runCommand(_ launchPath: String, args: [String]) -> String {
         let task = Process()
-        task.launchPath = "/bin/ps"
-        task.arguments = ["-o", "rss=", "-p", "\(pid)"]
-        
+        task.launchPath = launchPath
+        task.arguments = args
         let pipe = Pipe()
         task.standardOutput = pipe
-        task.standardError = Pipe()
-        
+        task.standardError = Pipe() // Ignore errors
         do {
             try task.run()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-               let kb = Double(output) {
-                return kb / 1024.0
-            }
-        } catch { } // Ignore
-        return 0.0
+            return String(data: data, encoding: .utf8) ?? ""
+        } catch {
+            return ""
+        }
     }
     
     private func refreshStats() {
-        // Get Total RAM
-        let total = Double(ProcessInfo.processInfo.physicalMemory) / 1024 / 1024 / 1024 // Bytes -> GB
+        // Physical Memory
+        let total = Double(ProcessInfo.processInfo.physicalMemory) / 1024 / 1024 / 1024
         
-        // Get Page Size
+        // Host Info for Physical Used
         var pageSize: vm_size_t = 0
         let hostPort: mach_port_t = mach_host_self()
         var hostSize: mach_msg_type_number_t = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
         var hostInfo = vm_statistics64_data_t()
-        
         host_page_size(hostPort, &pageSize)
         
         let status = withUnsafeMutablePointer(to: &hostInfo) {
@@ -155,17 +179,40 @@ class ProcessManager: ObservableObject {
             }
         }
         
+        var physicalUsed: Double = 0
         if status == KERN_SUCCESS {
-            // Calculate Used Memory (Active + Wired + Compressed for "Used" perception)
-            // Or simpler: (active + wired)
             let active = Double(hostInfo.active_count) * Double(pageSize)
             let wired = Double(hostInfo.wire_count) * Double(pageSize)
             let compressed = Double(hostInfo.compressor_page_count) * Double(pageSize)
-            
-            let usedBytes = active + wired + compressed
-            let used = usedBytes / 1024 / 1024 / 1024
-            
-            self.stats = SystemStats(totalRAM: total, usedRAM: used, freeRAM: total - used)
+            // Used = Active + Wired + Compressed
+            physicalUsed = (active + wired + compressed) / 1024 / 1024 / 1024
         }
+        
+        // Swap Usage via sysctl
+        // using generic shell because Swift sysctl wrapper is verbose
+        var swapUsed: Double = 0
+        let swapOutput = runCommand("/usr/sbin/sysctl", args: ["vm.swapusage"])
+        // output format: vm.swapusage: total = 1024.00M  used = 12.00M  free = 1012.00M  (encrypted)
+        if let usedRange = swapOutput.range(of: "used = ") {
+            let substring = swapOutput[usedRange.upperBound...]
+            let components = substring.components(separatedBy: " ")
+            if let valStr = components.first {
+                // valStr is like "12.00M" or "0.00M"
+                let value = Double(valStr.dropLast()) ?? 0
+                let unit = valStr.last
+                
+                if unit == "M" { swapUsed = value / 1024 }
+                else if unit == "G" { swapUsed = value }
+                else if unit == "K" { swapUsed = value / 1024 / 1024 }
+            }
+        }
+        
+        self.stats = SystemStats(
+            totalRAM: total,
+            physicalUsedRAM: physicalUsed,
+            swapUsedRAM: swapUsed,
+            freeRAM: total - physicalUsed
+        )
     }
 }
+
